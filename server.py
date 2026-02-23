@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify
 import cv2
 import numpy as np
 import os
-import easyocr
+from rapidocr_onnxruntime import RapidOCR
 
 app = Flask(__name__)
 
@@ -20,10 +20,11 @@ if os.path.exists(TEMPLATES_DIR):
                 templates_db[name] = {'image': img, 'w': w, 'h': h}
                 print(f"[图库] 成功加载模板图片: {name}.png")
 
-# --- 初始化 2：加载 OCR 模型 ---
-print("[系统] 正在加载 OCR 文字识别模型 (初次运行较慢，请稍候)...")
-reader = easyocr.Reader(['ch_sim', 'en'], gpu=False) 
-print("[系统] 双擎 (CV图片匹配 + OCR文字识别) 初始化完毕，等待虚拟机指令！\n" + "="*50)
+# 初始化改为：
+print("[系统] 正在加载 RapidOCR 极速识别模型...")
+engine = RapidOCR()
+print("[系统] OCR 模型加载完毕！")
+
 
 @app.route('/api/find_target', methods=['POST'])
 def find_target():
@@ -41,7 +42,7 @@ def find_target():
     # 彩色图留给 OCR 用，转换为灰度图给 OpenCV 用
     img_color = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     img_gray = cv2.cvtColor(img_color, cv2.COLOR_BGR2GRAY)
-     
+   
   # ==========================================
     # 引擎 1：精确图像匹配 (OpenCV 彩色模式)
     # ==========================================
@@ -69,7 +70,7 @@ def find_target():
         else:
             # 此时两张图格式绝对一致，放心匹配
             res = cv2.matchTemplate(img_color, template, cv2.TM_CCOEFF_NORMED)
-            threshold = 0.8
+            threshold = 0.6
             min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
             
             if max_val >= threshold:
@@ -81,53 +82,33 @@ def find_target():
                 print(f"[降级] 图片 '{target_img}' 匹配失败 (置信度 {max_val:.2f} < 0.8)，准备切换至 OCR...")
     elif target_img:
         print(f"[降级] 图库中不存在 '{target_img}.png'，准备切换至 OCR...")
+    cv2.imwrite("debug_screen.png", img_color)  # 调试用：保存接收到的截图
 # ==========================================
-    # 引擎 2：鲁棒文字识别 (EasyOCR 灰度模式)
+    # 引擎 2：鲁棒文字识别 (rapidOCR 灰度模式)
     # ==========================================
     if target_text:
-        print(f"[OCR] 正在扫描全屏文字，寻找关键词: '{target_text}' ...")
+        print(f"[OCR] 正在扫描文字，寻找: '{target_text}' ...")
         
-        # --- 新增提速黑科技：等比例缩放图片 ---
-        # 限制图片最大宽度为 1280 像素，大幅减少纯 CPU 的运算量
-        max_width = 1280
-        h, w = img_gray.shape
-        scale = 1.0 # 记录缩放比例，后面算坐标要乘回来
+        # RapidOCR 接受 numpy 数组，直接传 img_color 即可
+        # 返回格式：[[[左上, 右上, 右下, 左下], '文字', 置信度], ...]
+        result, _ = engine(img_color)
         
-        if w > max_width:
-            scale = max_width / w
-            new_w = max_width
-            new_h = int(h * scale)
-            # 缩放图片
-            ocr_img = cv2.resize(img_gray, (new_w, new_h))
-            print(f"[OCR优化] 原始尺寸 {w}x{h} 太大，已缩放至 {new_w}x{new_h} 以加速识别")
-        else:
-            ocr_img = img_gray
-        # -----------------------------------
-        
-        # 将缩放后的图片喂给 OCR
-        results = reader.readtext(ocr_img)
-        
-        for bbox, text, conf in results:
-            if target_text in text:
-                top_left = bbox[0]
-                bottom_right = bbox[2]
-                
-                # 计算中心点坐标
-                center_x = int((top_left[0] + bottom_right[0]) / 2)
-                center_y = int((top_left[1] + bottom_right[1]) / 2)
-                
-                # --- 关键：把坐标按缩放比例还原回真实屏幕坐标 ---
-                real_x = int(center_x / scale)
-                real_y = int(center_y / scale)
-                # ----------------------------------------------
-                
-                print(f"[命中] 文字 '{text}' 识别成功！(置信度: {conf:.2f})")
-                return jsonify({'found': True, 'x': real_x, 'y': real_y, 'method': 'ocr'})
+        if result:
+            for bbox, text, conf in result:
+                if target_text in text:
+                    # 解析坐标 (取对角线计算中心点)
+                    top_left = bbox[0]
+                    bottom_right = bbox[2]
+                    center_x = int((top_left[0] + bottom_right[0]) / 2)
+                    center_y = int((top_left[1] + bottom_right[1]) / 2)
+                    
+                    print(f"[命中] 文字 '{text}' 识别成功！(置信度: {conf:.2f})")
+                    return jsonify({'found': True, 'x': center_x, 'y': center_y, 'method': 'ocr'})
                 
         print(f"[失效] 屏幕上未找到包含 '{target_text}' 的文字。")
-
+   
     return jsonify({'found': False})
 
 if __name__ == '__main__':
     # 你指定的端口 5010
-    app.run(host='0.0.0.0', port=5010)
+    app.run(host='0.0.0.0', port=5010, debug=True)

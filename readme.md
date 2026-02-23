@@ -1,5 +1,5 @@
-pip install flask opencv-python numpy
-pip install easyocr
+pip install flask opencv-python numpy rapidocr_onnxruntime
+ 
 client
 pip install mss requests pyautogui
 
@@ -34,3 +34,6 @@ auto_download_rpa/
 │
 └── client/                    # 部署于 Win10 虚拟机 (四肢)
     └── client.py              # 客户端主程序 (状态机轮询、截图、模拟点击)
+
+
+    pip install   rapidocr_onnxruntime opencv-python
