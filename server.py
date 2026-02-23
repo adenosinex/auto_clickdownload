@@ -1,119 +1,133 @@
+from flask import Flask, request, jsonify
+import cv2
+import numpy as np
 import os
-import time
-import requests
-import mss
-import pyautogui
+import easyocr
 
-# --- 配置区 ---
-SERVER_URL = "http://15x4.zin6.dpdns.org:5010/api/find_target" 
-DOWNLOAD_DIR = r"\\One\d\downloadD" 
-CHECK_INTERVAL = 10 
-# --------------
+app = Flask(__name__)
 
-def is_active_downloading(directory):
-    """
-    高效检查下载状态：
-    1. 检查表层文件。
-    2. 筛选出最近5分钟内修改过的文件夹，进入内部检查文件。
-    """
-    if not os.path.exists(directory): 
-        print(f"[错误] 目录不存在: {directory}")
-        return False
+# --- 初始化 1：加载模板图库 ---
+TEMPLATES_DIR = 'templates'
+templates_db = {}
+if os.path.exists(TEMPLATES_DIR):
+    for filename in os.listdir(TEMPLATES_DIR):
+        if filename.endswith('.png') or filename.endswith('.PNG'):
+            name = filename.split('.')[0]
+            path = os.path.join(TEMPLATES_DIR, filename)
+            img = cv2.imread(path, 0)
+            if img is not None:
+                h, w = img.shape
+                templates_db[name] = {'image': img, 'w': w, 'h': h}
+                print(f"[图库] 成功加载模板图片: {name}.png")
+
+# --- 初始化 2：加载 OCR 模型 ---
+print("[系统] 正在加载 OCR 文字识别模型 (初次运行较慢，请稍候)...")
+reader = easyocr.Reader(['ch_sim', 'en'], gpu=False) 
+print("[系统] 双擎 (CV图片匹配 + OCR文字识别) 初始化完毕，等待虚拟机指令！\n" + "="*50)
+
+@app.route('/api/find_target', methods=['POST'])
+def find_target():
+    if 'screenshot' not in request.files:
+        return jsonify({'error': '未收到截图'}), 400
         
-    current_time = time.time()
-    five_minutes_ago = current_time - (5 * 60)
+    target_img = request.form.get('target_img')   # 期望的图片模板名
+    target_text = request.form.get('target_text') # 期望寻找的文字
     
-    try:
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                # 1. 检查表层的临时文件
-                if entry.is_file() and entry.name.endswith('.qkdownloading'):
-                    if entry.stat().st_mtime > five_minutes_ago:
-                        print(f"[状态] 活跃下载中 (表层): {entry.name}")
-                        return True
-                        
-                # 2. 检查最近 5 分钟内有变动（如刚创建、或内部新建了文件）的文件夹
-                elif entry.is_dir():
-                    if entry.stat().st_mtime > five_minutes_ago:
-                        try:
-                            # 深入该文件夹检查内部文件
-                            with os.scandir(entry.path) as sub_entries:
-                                for sub_entry in sub_entries:
-                                    if sub_entry.is_file() and sub_entry.name.endswith('.qkdownloading'):
-                                        if sub_entry.stat().st_mtime > five_minutes_ago:
-                                            print(f"[状态] 活跃下载中 (内部): {entry.name}/{sub_entry.name}")
-                                            return True
-                        except Exception as e:
-                            print(f"[系统] 扫描子文件夹 {entry.name} 出错: {e}")
-                            
-    except Exception as e: 
-        print(f"[系统] 扫描主目录出错: {e}")
+    # 接收截图并解码为内存数组
+    file = request.files['screenshot']
+    in_memory_file = file.read()
+    nparr = np.frombuffer(in_memory_file, np.uint8)
+    
+    # 彩色图留给 OCR 用，转换为灰度图给 OpenCV 用
+    img_color = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    img_gray = cv2.cvtColor(img_color, cv2.COLOR_BGR2GRAY)
+     
+  # ==========================================
+    # 引擎 1：精确图像匹配 (OpenCV 彩色模式)
+    # ==========================================
+    if target_img and target_img in templates_db:
+        target_data = templates_db[target_img]
+        template = target_data['image']
+        w, h = target_data['w'], target_data['h']
         
-    return False
-
-def find_and_click(target_name):
-    """
-    通用寻图点击函数：截取屏幕，请求服务器寻找 target_name，如果找到则点击并返回 True。
-    """
-    screenshot_path = "temp_screen.png"
-    
-    # 1. 极速截图
-    with mss.mss() as sct:
-        sct.shot(mon=1, output=screenshot_path)
-    
-    try:
-        # 2. 发送截图和 target_name 给服务器
-        with open(screenshot_path, 'rb') as f:
-            files = {'screenshot': ('screen.png', f, 'image/png')}
-            data = {'target_name': target_name}
-            response = requests.post(SERVER_URL, files=files, data=data, timeout=5)
+        # 【新增：终极防崩溃装甲 - 强制统一通道数】
+        # 1. 确保模板图 (template) 是标准 3 通道 BGR 彩色图
+        if len(template.shape) == 2: 
+            template = cv2.cvtColor(template, cv2.COLOR_GRAY2BGR)
+        elif len(template.shape) == 3 and template.shape[2] == 4: 
+            template = cv2.cvtColor(template, cv2.COLOR_BGRA2BGR)
             
-        result = response.json()
-        
-        # 3. 解析结果并执行点击
-        if result.get('found'):
-            x, y = result['x'], result['y']
-            print(f"[动作] 成功点击目标 [{target_name}] -> 坐标 ({x}, {y})")
-            pyautogui.moveTo(x, y, duration=0.2)
-            pyautogui.click()
-            time.sleep(2) # 给软件UI反应的时间
-            return True
+        # 2. 确保客户端截图 (img_color) 也是标准 3 通道 BGR
+        if len(img_color.shape) == 2:
+            img_color = cv2.cvtColor(img_color, cv2.COLOR_GRAY2BGR)
+        elif len(img_color.shape) == 3 and img_color.shape[2] == 4:
+            img_color = cv2.cvtColor(img_color, cv2.COLOR_BGRA2BGR)
+
+        # 3. 尺寸防御：防止极端情况下截图比模板还小导致崩溃
+        if img_color.shape[0] < template.shape[0] or img_color.shape[1] < template.shape[1]:
+            print(f"[引擎1失效] 截图尺寸小于模板尺寸，无法匹配。")
         else:
-            return False
+            # 此时两张图格式绝对一致，放心匹配
+            res = cv2.matchTemplate(img_color, template, cv2.TM_CCOEFF_NORMED)
+            threshold = 0.8
+            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
             
-    except Exception as e:
-        print(f"[网络错误] 请求失败: {e}")
-        return False
-    finally:
-        if os.path.exists(screenshot_path):
-            os.remove(screenshot_path)
-
-def main_loop():
-    print("=== 高级自动化下载终端已启动 ===")
-    while True:
-        if is_active_downloading(DOWNLOAD_DIR):
-            # 状态 1：正常下载中，挂机等待
-            time.sleep(CHECK_INTERVAL)
-            continue
-            
-        print("\n[逻辑] 当前无活跃下载，开始分析 UI 状态...")
+            if max_val >= threshold:
+                center_x = max_loc[0] + w // 2
+                center_y = max_loc[1] + h // 2
+                print(f"[命中] 彩色图片 '{target_img}' 匹配成功！(置信度: {max_val:.2f})")
+                return jsonify({'found': True, 'x': center_x, 'y': center_y, 'method': 'image'})
+            else:
+                print(f"[降级] 图片 '{target_img}' 匹配失败 (置信度 {max_val:.2f} < 0.8)，准备切换至 OCR...")
+    elif target_img:
+        print(f"[降级] 图库中不存在 '{target_img}.png'，准备切换至 OCR...")
+# ==========================================
+    # 引擎 2：鲁棒文字识别 (EasyOCR 灰度模式)
+    # ==========================================
+    if target_text:
+        print(f"[OCR] 正在扫描全屏文字，寻找关键词: '{target_text}' ...")
         
-        # 状态 2：尝试寻找并点击正常的“下载”按钮
-        if find_and_click('btn_download'):
-            print("[逻辑] 已启动新下载任务。")
-            time.sleep(CHECK_INTERVAL)
-            continue
-            
-        # 状态 3：处理可能存在的获取/确认按钮
-        if find_and_click('btn_get'):
-            print("[逻辑] 发现获取/确认按钮，已点击。")
-            time.sleep(CHECK_INTERVAL)
-            continue
-            
-        # 状态 4：什么都没找到，盲等
-        print("[逻辑] 当前画面无已知操作目标，等待下一次检查。")
-        time.sleep(CHECK_INTERVAL)
+        # --- 新增提速黑科技：等比例缩放图片 ---
+        # 限制图片最大宽度为 1280 像素，大幅减少纯 CPU 的运算量
+        max_width = 1280
+        h, w = img_gray.shape
+        scale = 1.0 # 记录缩放比例，后面算坐标要乘回来
+        
+        if w > max_width:
+            scale = max_width / w
+            new_w = max_width
+            new_h = int(h * scale)
+            # 缩放图片
+            ocr_img = cv2.resize(img_gray, (new_w, new_h))
+            print(f"[OCR优化] 原始尺寸 {w}x{h} 太大，已缩放至 {new_w}x{new_h} 以加速识别")
+        else:
+            ocr_img = img_gray
+        # -----------------------------------
+        
+        # 将缩放后的图片喂给 OCR
+        results = reader.readtext(ocr_img)
+        
+        for bbox, text, conf in results:
+            if target_text in text:
+                top_left = bbox[0]
+                bottom_right = bbox[2]
+                
+                # 计算中心点坐标
+                center_x = int((top_left[0] + bottom_right[0]) / 2)
+                center_y = int((top_left[1] + bottom_right[1]) / 2)
+                
+                # --- 关键：把坐标按缩放比例还原回真实屏幕坐标 ---
+                real_x = int(center_x / scale)
+                real_y = int(center_y / scale)
+                # ----------------------------------------------
+                
+                print(f"[命中] 文字 '{text}' 识别成功！(置信度: {conf:.2f})")
+                return jsonify({'found': True, 'x': real_x, 'y': real_y, 'method': 'ocr'})
+                
+        print(f"[失效] 屏幕上未找到包含 '{target_text}' 的文字。")
 
-if __name__ == "__main__":
-    pyautogui.FAILSAFE = True 
-    main_loop()
+    return jsonify({'found': False})
+
+if __name__ == '__main__':
+    # 你指定的端口 5010
+    app.run(host='0.0.0.0', port=5010)
